@@ -2,140 +2,265 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-data = pd.read_csv('mp_considated_v1.csv')
-data = data[data['Measurement'] != -999]
-
-bins = [0, 0.0005, 0.001, 0.008, 0.01, 1, 100000]
-labels = [0, 1, 2, 3, 4, 5]
-
-data['classification'] = pd.cut(data['Measurement'], bins=bins, labels=labels, right=False)
-data['classification'] = pd.to_numeric(data['classification']).astype('int64')
-data = data.sort_values(by='Year')
-
-X = data.drop(columns=['Measurement','classification','windspeed (m/s)','Date'])  # features
-y = data['classification']  # target variaable
-
-# 3. Divide the training set and test set
-X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
-X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
-
-scaler = MinMaxScaler()
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-X_scaled = scaler.fit_transform(X)  # Normalize input data
-X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
-
-nan_mask = torch.isnan(X_tensor)
-column_means = torch.nanmean(X_tensor, dim=0)
-X_tensor[nan_mask] = column_means.expand_as(X_tensor)[nan_mask]
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.impute import KNNImputer
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchmetrics import F1Score, Recall
+from torch.utils.data import Dataset, DataLoader
 
-# Convert to torch tensors and reshape
-X_train_t = torch.tensor(X_train.values, dtype=torch.float32).view(X_train.shape[0], 1, X_train.shape[1])
-X_val_t = torch.tensor(X_val.values, dtype=torch.float32).view(X_val.shape[0], 1, X_val.shape[1])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Detect device
 
-x_train_reshaped = X_train_t.view(-1, X_train_t.shape[-1]).numpy()  
-imputer = KNNImputer(n_neighbors=3, weights="uniform")  
-x_train_imputed = imputer.fit_transform(x_train_reshaped)
-X_train_t = torch.tensor(x_train_imputed).view(9407, 1, 10)
-
-# Convert labels (Pandas Series to NumPy arrays, then to tensors)
-num_classes = 6
-y_train_t = torch.tensor(y_train.values, dtype=torch.long)
-print(torch.unique(y_train_t))
-y_train_t = torch.clamp(y_train_t, 0, num_classes - 1)
-
-y_val_t = torch.tensor(y_val.values, dtype=torch.long)
-
-class TransformerModel(nn.Module):
-    def __init__(self, input_dim, num_classes, d_model=64, nhead=4, num_layers=2, dim_feedforward=128, dropout=0.1):
-        super(TransformerModel, self).__init__()
+class TransformerSimCLR(nn.Module):
+    def __init__(self, input_dim, d_model=128, nhead=8, num_layers=6, dim_feedforward=256, dropout=0.3, data = dict()):
+        super(TransformerSimCLR, self).__init__()
         
-        # Positional encoding for sequences
-        self.positional_encoding = nn.Parameter(torch.zeros(1, 100, d_model))  # Max 100 timesteps, adjust as needed
-        
-        # Embedding layer to project input features into d_model dimensions
         self.input_embedding = nn.Linear(input_dim, d_model)
-        
-        # Transformer encoder
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Fully connected classification head
-        self.fc = nn.Linear(d_model, num_classes)
+        # Projection head 
+        self.projection_head = nn.Sequential(
+            nn.Linear(d_model, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128)
+        )
+        self.data = data
+        self.init()
+    
+    def init(self):
+        self.train_data, self.train_label, self.country_idx_train  = self.data['train_data']
+        self.test_data, self.test_label, self.country_idx_test =  self.data['test_data']
+        self.save1, self.save2, self.save3 = self.train_data, self.train_label, self.country_idx_train
+        self.save4, self.save5, self.save6 = self.test_data, self.test_label, self.country_idx_test 
 
+    def augment_data(self, data, noise_factor=0.1):
+        """ add noise """
+        augmented_data = data + noise_factor * torch.randn_like(data)
+        augmented_data = (augmented_data - augmented_data.mean()) / augmented_data.std()
+        return augmented_data
+    
     def forward(self, x):
-        """
-        x: [batch_size, timesteps, input_dim]
-        """
-        # Apply positional encoding
-        seq_len = x.size(1)
-        x = self.input_embedding(x) + self.positional_encoding[:, :seq_len, :]  # [batch_size, timesteps, d_model]
-        
-        # Transformer encoder expects input as [sequence_length, batch_size, d_model]
-        x = x.permute(1, 0, 2)  # [timesteps, batch_size, d_model]
-        x = self.transformer_encoder(x)  # [timesteps, batch_size, d_model]
-        
-        # Pooling (take the mean over the timesteps)
-        x = x.mean(dim=0)  # [batch_size, d_model]
-        
-        # Fully connected layer for classification
-        x = self.fc(x)  # [batch_size, num_classes]
+        x = self.input_embedding(x)
+        x = x.permute(1, 0, 2)  
+        x = self.transformer_encoder(x)
+        x = x.mean(dim=0)  
+        x = self.projection_head(x)
         return x
 
-from torchmetrics import F1Score, Recall
+    def save_weights(self):
+        self.train_data = torch.cat((self.save1, self.save4[0:int(0.7 * len(self.save4))]))
+        self.train_label = torch.cat((self.save2, self.save5[0:int(0.7 * len(self.save4))]))
+        self.country_idx_train = torch.cat((self.save3, self.save6[0:int(0.7 * len(self.save4))]))
+        torch.save(model.transformer_encoder.state_dict(), 'transformer_encoder.pth')
+    
+class TransformerPre(nn.Module):
+    def __init__(self, input_dim, num_classes, num_countries, d_model=128, nhead=8, num_layers=6,
+                 dim_feedforward=256, dropout=0.3, country_embedding_dim=8, model = None):
+        super(TransformerPre, self).__init__()
 
-# If multi-class:
-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#class_weights = torch.tensor([1.97, 3.65, 4.62, 10, 10], dtype=torch.float32).to(device)
-#criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        self.country_embedding = nn.Embedding(num_countries, country_embedding_dim)
+        self.positional_encoding = nn.Parameter(torch.zeros(1, 100, d_model))
+        self.input_embedding = nn.Linear(input_dim + country_embedding_dim, d_model)  
+        self.input_embedding_s =   nn.Linear(input_dim , d_model)  
 
-# Initialize model
-model = TransformerModel(
-    input_dim=10,          
-    num_classes=5,        
-    d_model=128,     #or 256       
-    nhead=8,              
-    num_layers=6,       
-    dim_feedforward=256,   
-    dropout=0.3              
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.projection_head = nn.Sequential(
+            nn.Linear(d_model, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128)
+        )
+        self.fc = nn.Linear(d_model, num_classes)
+        self.model = model
+        self.init_weight()
+
+    def forward(self, x, country_idx):
+        """
+        x: [batch_size, timesteps, input_dim]
+        country_idx: [batch_size]
+        """
+        country_emb = self.country_embedding(country_idx)  # Shape: [batch_size, country_embedding_dim]
+        x = torch.cat([x, country_emb.unsqueeze(1).repeat(1, x.size(1), 1)], dim=-1)  
+        x = self.input_embedding(x)
+        seq_len = x.size(1)
+        x = x + self.positional_encoding[:, :seq_len, :] 
+        x = x.permute(1, 0, 2)  # [timesteps, batch_size, d_model]
+        
+        x = self.transformer_encoder(x) 
+        x = x.mean(dim=0)  
+        ep = self.projection_head(x)
+        classification = self.fc(ep)  
+
+        return ep, classification
+    
+    def init_weight(self):
+        transformer_encoder_params = torch.load('transformer_encoder.pth')
+        self.transformer_encoder.load_state_dict(transformer_encoder_params)
+        self.train_data, self.train_label, self.country_idx_train = self.model.train_data, self.model.train_label, self.model.country_idx_train    
+        self.test_data, self.test_label, self.country_idx_test = self.model.test_data, self.model.test_label, self.model.country_idx_test  
+        
+        print("+++++++++++++++++++++load weights from pretraining!+++++++++++++++++++++")
+class NTXentLoss(nn.Module):
+    def __init__(self, temperature=0.5):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, z1, z2):
+
+        similarity_matrix = F.cosine_similarity(z1.unsqueeze(1), z2.unsqueeze(0), dim=-1)
+        labels = torch.arange(similarity_matrix.size(0)).to(similarity_matrix.device)
+        loss = F.cross_entropy(similarity_matrix / self.temperature, labels)
+        return loss
+
+
+# def augment_data(data, noise_factor=0.1):
+#     """ Add noise and normalize """
+#     augmented_data = data + noise_factor * torch.randn_like(data)
+#     augmented_data = (augmented_data - augmented_data.mean()) / augmented_data.std()
+#     return augmented_data
+
+data = pd.read_csv('mp_v10.csv')
+data = data[data['Measurement'] != -999]
+
+bins = [0, 0.0005, 0.005, 1, 10, 100000]
+labels = [0, 1, 2, 3, 4]
+data['classification'] = pd.cut(data['Measurement'], bins=bins, labels=labels, right=False)
+data['classification'] = pd.to_numeric(data['classification']).astype('int64')
+
+# Encode Country and convert into categorical integer
+country_labels = data['Country'].astype('category').cat.codes
+data['Country_encoded'] = country_labels
+data = data.sort_values(by='Year')
+X = data.drop(columns=['Measurement', 'classification', 'Date', 'Country'])
+y = data['classification']
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
 )
 
-# Loss and optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
-num_classes = 6
+X_train_np = X_train.values
+X_test_np = X_test.values
 
-# Initialize metrics
-f1_metric = F1Score(num_classes=num_classes, average="macro", task='multiclass')  # Macro for multi-class
-recall_metric = Recall(num_classes=num_classes, average="macro", task='multiclass')
+imputer = KNNImputer(n_neighbors=3, weights="uniform")
+X_train_imputed = imputer.fit_transform(X_train_np)
+X_test_imputed = imputer.transform(X_test_np)
 
-# Training loop
-for epoch in range(110):
+scaler = MinMaxScaler()
+X_train_scaled = scaler.fit_transform(X_train_imputed)
+X_test_scaled = scaler.transform(X_test_imputed)
+
+num_train_samples, num_features = X_train_scaled.shape
+num_val_samples = X_test_scaled.shape[0]
+X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32).view(num_train_samples, 1, num_features)
+X_test_t = torch.tensor(X_test_scaled, dtype=torch.float32).view(num_val_samples, 1, num_features)
+
+y_train_t = torch.tensor(y_train.values, dtype=torch.long)
+y_test_t = torch.tensor(y_test.values, dtype=torch.long)
+
+
+country_idx_train = torch.tensor(X_train['Country_encoded'].values, dtype=torch.long)
+country_idx_test = torch.tensor(X_test['Country_encoded'].values, dtype=torch.long)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+X_train_t = X_train_t.to(device)
+X_test_t = X_test_t.to(device)
+y_train_t = y_train_t.to(device)
+y_test_t = y_test_t.to(device)
+country_idx_train = country_idx_train.to(device)
+country_idx_test = country_idx_test.to(device)
+
+
+
+
+datas = {"train_data":[X_train_t, y_train_t, country_idx_train], "test_data":[X_test_t, y_test_t, country_idx_test]}
+
+model = TransformerSimCLR(input_dim=num_features, data = datas).to(device)
+criterion = NTXentLoss(temperature=0.5)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+train_loader = DataLoader(model.train_data, batch_size=1024, shuffle=True)  
+
+num_epochs = 300
+for epoch in range(num_epochs):
     model.train()
+    total_loss = 0
+    for batch in train_loader:
+        batch = batch.to(device)
+        augmented_batch = model.augment_data(batch)
+        z1 = model(batch)
+        z2 = model(augmented_batch)
+        loss = criterion(z1, z2)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"++++++++++++++Contrastive training Epoch {epoch + 1}, Loss: {total_loss /( len(train_loader)*10)}----------------------")
+model.save_weights()
+
+______________________________________________________________________________________________________________________________
+
+from torchmetrics import AUROC
+
+pre_model = TransformerPre(input_dim=num_features, num_classes=5, num_countries=len(data['Country'].unique()), model = model).to(device)
+
+optimizer = torch.optim.Adam(pre_model.parameters(), lr=1e-3, weight_decay=1e-5)
+criterion = nn.CrossEntropyLoss()
+f1_metric = F1Score(num_classes=5,average="macro", task='multiclass').to(device)
+recall_metric = Recall(num_classes=5, average="macro", task='multiclass').to(device)
+aucroc_metric = AUROC(num_classes=5, average="macro", task="multiclass").to(device)
+
+num_epochs = 900
+for epoch in range(num_epochs): 
+    pre_model.train()
     optimizer.zero_grad()
-    logits = model(X_train_t)          
-    loss = criterion(logits, y_train_t)  
-    loss.backward()                     
-    optimizer.step()                    
+    logits = pre_model(pre_model.train_data, pre_model.country_idx_train)[1] 
+    loss = criterion(logits, pre_model.train_label) 
+    loss.backward() 
+    optimizer.step()
+    pre_model.eval()
 
-    # Validation accuracy
-    model.eval()
     with torch.no_grad():
-        val_logits = model(X_val_t)
+        val_logits = pre_model(pre_model.test_data, pre_model.country_idx_test)[1]
         val_preds = torch.argmax(val_logits, dim=1)
-        val_accuracy = (val_preds == y_val_t).float().mean().item()
+        val_accuracy = (val_preds == pre_model.test_label).float().mean().item()
 
-    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, Validation Accuracy: {val_accuracy:.4f}, "
-          f"F1 Score: {f1_score:.4f}, Recall: {recall:.4f}")
+        f1_score = f1_metric(val_preds, pre_model.test_label)
+        recall = recall_metric(val_preds, pre_model.test_label)
+
+        train_logits = pre_model(pre_model.train_data, pre_model.country_idx_train)[1]
+        train_preds = torch.argmax(train_logits, dim=1)
+        train_accuracy = (train_preds == pre_model.train_label).float().mean().item()
+
+        tf1_score = f1_metric(train_preds, pre_model.train_label)
+        trecall = recall_metric(train_preds, pre_model.train_label)
+
+        print(f"Epoch {epoch + 1:03d} | Loss: {loss.item():.4f} | train Accuracy: {train_accuracy:.4f} | "
+            f"F1 Score: {tf1_score.item():.4f} | Recall: {trecall.item():.4f}")
+        
+with torch.no_grad():
+    test_logits = pre_model(pre_model.test_data, pre_model.country_idx_test)[1]
+    test_preds = torch.argmax(test_logits, dim=1)
+    test_accuracy = (test_preds == pre_model.test_label).float().mean().item()
+
+    f1_score = f1_metric(test_preds, pre_model.test_label)
+    recall = recall_metric(test_preds, pre_model.test_label)
+
+    # train_logits = pre_model(pre_model.train_data, pre_model.country_idx_train)[1]
+    # train_preds = torch.argmax(train_logits, dim=1)
+    # train_accuracy = (train_preds == pre_model.train_label).float().mean().item()
+
+    # tf1_score = f1_metric(train_preds, pre_model.train_label)
+    # trecall = recall_metric(train_preds, pre_model.train_label)
+
+    print(f" Test Accuracy: {test_accuracy:.4f} | "
+        f"F1 Score: {f1_score.item():.4f} | Recall: {recall.item():.4f} ")
